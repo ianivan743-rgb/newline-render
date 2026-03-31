@@ -97,6 +97,28 @@
   const tabs = document.querySelectorAll(".tab");
   let mode = "nl";
 
+  // ============= 0) 历史记录 UI 注入（不改你的HTML结构也能工作）=============
+  const toolbar = document.querySelector(".toolbar");
+  const historyWrap = document.createElement("div");
+  historyWrap.style.width = "100%";
+  historyWrap.style.marginTop = "8px";
+  historyWrap.innerHTML = `
+    <div style="display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+      <div class="hint">往期数据（保存15天，保存在本机浏览器localStorage）：</div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button id="btnToggleHistory">展开/收起</button>
+        <button id="btnClearHistory">清空往期</button>
+      </div>
+    </div>
+    <div id="historyPanel" style="margin-top:8px; display:none; border:1px solid #ddd; border-radius:8px; padding:8px; background:#fff; max-height:220px; overflow:auto;"></div>
+  `;
+  toolbar.after(historyWrap);
+
+  const btnToggleHistory = document.getElementById("btnToggleHistory");
+  const btnClearHistory = document.getElementById("btnClearHistory");
+  const historyPanel = document.getElementById("historyPanel");
+
+  // ============= 1) 基础：换行渲染 / JSON抽取解析 ==============
   function renderNewlines(text) {
     if (text == null) return "";
     let s = String(text);
@@ -115,7 +137,6 @@
     return s.trim();
   }
 
-  // 提取第一个 JSON（对象/数组），按括号配对，跳过字符串内容
   function extractFirstJsonByBrackets(s) {
     const n = s.length;
     let start = -1;
@@ -138,7 +159,7 @@
         if (ch === quote) { inStr = false; quote = ""; continue; }
         continue;
       } else {
-        if (ch === '"') { inStr = true; quote = ch; continue; } // JSON标准仅双引号
+        if (ch === '"') { inStr = true; quote = ch; continue; }
         if (ch === open) depth++;
         if (ch === close) {
           depth--;
@@ -149,7 +170,6 @@
     return null;
   }
 
-  // 关键：把 JSON 字符串值中的真实控制字符（\n \r \t）转义掉，避免 Bad control character
   function escapeControlCharsInsideJsonStrings(jsonText) {
     let out = "";
     let inStr = false;
@@ -164,63 +184,44 @@
         continue;
       }
 
-      // inStr === true
-      if (escape) {
-        // 当前字符是被转义的，原样保留
-        out += ch;
-        escape = false;
-        continue;
-      }
+      if (escape) { out += ch; escape = false; continue; }
 
-      if (ch === "\\") {
-        out += ch;
-        escape = true;
-        continue;
-      }
+      if (ch === "\\") { out += ch; escape = true; continue; }
 
-      if (ch === '"') {
-        out += ch;
-        inStr = false;
-        continue;
-      }
+      if (ch === '"') { out += ch; inStr = false; continue; }
 
-      // 字符串内部遇到真实控制字符 -> 转义
       if (ch === "\n") { out += "\\n"; continue; }
       if (ch === "\r") { out += "\\r"; continue; }
       if (ch === "\t") { out += "\\t"; continue; }
 
       out += ch;
     }
-
     return out;
   }
 
+  // 返回：{ok,value,source,candidate, jsonTextUsed}
   function tryParseJson(text) {
     let s = renderNewlines(text);
     s = stripMarkdownCodeFence(s);
 
-    // 1) 直接 parse
     try {
-      return { ok: true, value: JSON.parse(s), source: "direct" };
+      return { ok: true, value: JSON.parse(s), source: "direct", jsonTextUsed: s };
     } catch (e1) {
-      // 2) 直接失败：尝试“字符串内控制字符转义”再 parse
       try {
         const fixed = escapeControlCharsInsideJsonStrings(s);
-        return { ok: true, value: JSON.parse(fixed), source: "direct+escape" };
+        return { ok: true, value: JSON.parse(fixed), source: "direct+escape", jsonTextUsed: fixed };
       } catch (e1b) {}
     }
 
-    // 3) 抽取片段再 parse
     const cand = extractFirstJsonByBrackets(s);
     if (!cand) return { ok: false, error: new Error("未找到可解析的 JSON（没有 { 或 [ ）") };
 
     try {
-      return { ok: true, value: JSON.parse(cand), source: "extracted" };
+      return { ok: true, value: JSON.parse(cand), source: "extracted", candidate: cand, jsonTextUsed: cand };
     } catch (e2) {
-      // 4) 抽取片段失败：再做一次控制字符转义
       try {
         const fixedCand = escapeControlCharsInsideJsonStrings(cand);
-        return { ok: true, value: JSON.parse(fixedCand), source: "extracted+escape" };
+        return { ok: true, value: JSON.parse(fixedCand), source: "extracted+escape", candidate: cand, jsonTextUsed: fixedCand };
       } catch (e2b) {
         return { ok: false, error: e2b, candidate: cand };
       }
@@ -233,46 +234,445 @@
     return `type: ${typeof val}`;
   }
 
-  function update() {
+  // ============= 2) 换行渲染：左右选区字符映射（近似但好用）=============
+  // 建立 raw -> rendered 的索引映射：把 \r\n \n \r 字面量当成 1 个 '\n'
+  function buildNlMapping(raw) {
+    const src = String(raw ?? "");
+    let rendered = "";
+    const mapSrcToDst = new Array(src.length + 1);
+    const mapDstToSrc = []; // dst index -> src index (nearest)
+
+    let si = 0, di = 0;
+    while (si < src.length) {
+      mapSrcToDst[si] = di;
+      const ch = src[si];
+
+      // 字面量 \r\n
+      if (ch === "\\" && src.slice(si, si + 4) === "\\r\\n") {
+        rendered += "\n";
+        // 这4个字符都映射到同一个 di
+        mapSrcToDst[si + 1] = di;
+        mapSrcToDst[si + 2] = di;
+        mapSrcToDst[si + 3] = di;
+        mapDstToSrc[di] = si;
+        si += 4; di += 1;
+        continue;
+      }
+      // 字面量 \n
+      if (ch === "\\" && src.slice(si, si + 2) === "\\n") {
+        rendered += "\n";
+        mapSrcToDst[si + 1] = di;
+        mapDstToSrc[di] = si;
+        si += 2; di += 1;
+        continue;
+      }
+      // 字面量 \r
+      if (ch === "\\" && src.slice(si, si + 2) === "\\r") {
+        rendered += "\n";
+        mapSrcToDst[si + 1] = di;
+        mapDstToSrc[di] = si;
+        si += 2; di += 1;
+        continue;
+      }
+
+      // 真实换行统一：\r\n / \r -> \n
+      if (ch === "\r") {
+        if (src[si + 1] === "\n") {
+          rendered += "\n";
+          mapSrcToDst[si + 1] = di;
+          mapDstToSrc[di] = si;
+          si += 2; di += 1;
+          continue;
+        }
+        rendered += "\n";
+        mapDstToSrc[di] = si;
+        si += 1; di += 1;
+        continue;
+      }
+
+      // 普通字符
+      rendered += ch;
+      mapDstToSrc[di] = si;
+      si += 1; di += 1;
+    }
+    mapSrcToDst[src.length] = di;
+
+    // 补齐 mapDstToSrc 的结尾
+    mapDstToSrc[rendered.length] = src.length;
+
+    return { rendered, mapSrcToDst, mapDstToSrc };
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function applyMarkToText(text, start, end) {
+    // start/end 是字符索引（0..len）
+    const s = Math.max(0, Math.min(text.length, start));
+    const e = Math.max(0, Math.min(text.length, end));
+    if (e <= s) return escapeHtml(text);
+    return escapeHtml(text.slice(0, s)) +
+      "<mark>" + escapeHtml(text.slice(s, e)) + "</mark>" +
+      escapeHtml(text.slice(e));
+  }
+
+  let lastNl = {
+    raw: "",
+    rendered: "",
+    mapSrcToDst: null,
+    mapDstToSrc: null,
+    highlightRaw: null,      // {start,end}
+    highlightRendered: null  // {start,end}
+  };
+
+  function setRightHtml(html) {
+    outEl.innerHTML = html;
+  }
+
+  function getTextareaSelection(el) {
+    return { start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 };
+  }
+
+  function setTextareaSelection(el, start, end) {
+    el.focus();
+    el.setSelectionRange(start, end);
+  }
+
+  // ============= 3) JSON解析：key 粒度联动（非字符级精确）=============
+  let lastJson = {
+    ok: false,
+    pretty: "",
+    jsonTextUsed: "",
+    keysToLineIndex: new Map(), // key -> first line index in pretty
+    lines: []
+  };
+
+  function buildJsonKeyIndex(prettyText) {
+    const lines = prettyText.split("\n");
+    const map = new Map();
+    const keyRe = /^\s*"([^"]+)"\s*:\s*/; // 匹配 "key":
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(keyRe);
+      if (m && !map.has(m[1])) map.set(m[1], i);
+    }
+    return { lines, map };
+  }
+
+  function highlightJsonLine(prettyText, lineIndex) {
+    const lines = prettyText.split("\n");
+    if (lineIndex < 0 || lineIndex >= lines.length) return escapeHtml(prettyText);
+    lines[lineIndex] = "<mark>" + escapeHtml(lines[lineIndex]) + "</mark>";
+    // 其他行也要 escape
+    for (let i = 0; i < lines.length; i++) {
+      if (i !== lineIndex) lines[i] = escapeHtml(lines[i]);
+    }
+    return lines.join("\n");
+  }
+
+  function findKeyNearCursorInPretty(prettyText, cursorIndex) {
+    // 找 cursor 所在行
+    const before = prettyText.slice(0, cursorIndex);
+    const line = before.split("\n").length - 1;
+    const lines = prettyText.split("\n");
+    const keyRe = /^\s*"([^"]+)"\s*:\s*/;
+    const m = (lines[line] || "").match(keyRe);
+    return m ? { key: m[1], line } : null;
+  }
+
+  function findFirstOccurrenceInRaw(raw, needle) {
+    const s = String(raw ?? "");
+    const i = s.indexOf(needle);
+    return i >= 0 ? i : -1;
+  }
+
+  // ============= 4) 历史记录（localStorage, 15天）=============
+  const HISTORY_KEY = "newline_tool_history_v1";
+  const HISTORY_DAYS = 15;
+  const HISTORY_MAX_ITEMS = 200;
+
+  function nowTs() { return Date.now(); }
+  function tsToString(ts) {
+    const d = new Date(ts);
+    const pad = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function loadHistory() {
+    try {
+      const s = localStorage.getItem(HISTORY_KEY);
+      if (!s) return [];
+      const arr = JSON.parse(s);
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveHistory(arr) {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(arr));
+  }
+
+  function pruneHistory(arr) {
+    const cutoff = nowTs() - HISTORY_DAYS * 24 * 3600 * 1000;
+    arr = arr.filter(x => x && typeof x.ts === "number" && x.ts >= cutoff && typeof x.text === "string");
+    arr.sort((a,b) => b.ts - a.ts);
+    if (arr.length > HISTORY_MAX_ITEMS) arr = arr.slice(0, HISTORY_MAX_ITEMS);
+    return arr;
+  }
+
+  function addToHistory(text) {
+    const t = String(text ?? "");
+    if (!t.trim()) return;
+
+    let arr = pruneHistory(loadHistory());
+
+    // 简单去重：如果最新一条内容相同就不重复插入
+    if (arr[0] && arr[0].text === t) return;
+
+    arr.unshift({ ts: nowTs(), text: t });
+    arr = pruneHistory(arr);
+    saveHistory(arr);
+    renderHistoryPanel();
+  }
+
+  function renderHistoryPanel() {
+    const arr = pruneHistory(loadHistory());
+    if (arr.length === 0) {
+      historyPanel.innerHTML = `<div class="hint">暂无往期数据</div>`;
+      return;
+    }
+    historyPanel.innerHTML = arr.map((x, idx) => {
+      const preview = escapeHtml(x.text.slice(0, 120)).replaceAll("\n", "\\n");
+      return `
+        <div style="display:flex; gap:8px; align-items:center; padding:6px 4px; border-bottom:1px dashed #eee;">
+          <button data-act="load" data-idx="${idx}">加载</button>
+          <button data-act="del" data-idx="${idx}">删除</button>
+          <div style="flex:1; min-width:0;">
+            <div style="font-size:12px; color:#333;">${tsToString(x.ts)}</div>
+            <div style="font-size:12px; color:#666; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${preview}</div>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  historyPanel.addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const idx = Number(btn.dataset.idx);
+    let arr = pruneHistory(loadHistory());
+    if (!Number.isFinite(idx) || idx < 0 || idx >= arr.length) return;
+
+    if (act === "load") {
+      rawEl.value = arr[idx].text;
+      update(true);
+      rawEl.focus();
+    } else if (act === "del") {
+      arr.splice(idx, 1);
+      saveHistory(pruneHistory(arr));
+      renderHistoryPanel();
+    }
+  });
+
+  btnToggleHistory.addEventListener("click", () => {
+    historyPanel.style.display = (historyPanel.style.display === "none") ? "block" : "none";
+    if (historyPanel.style.display === "block") renderHistoryPanel();
+  });
+
+  btnClearHistory.addEventListener("click", () => {
+    localStorage.removeItem(HISTORY_KEY);
+    renderHistoryPanel();
+  });
+
+  // 输入节流保存历史：停止输入 800ms 认为一条
+  let histTimer = null;
+  function scheduleHistorySave() {
+    if (histTimer) clearTimeout(histTimer);
+    histTimer = setTimeout(() => addToHistory(rawEl.value), 800);
+  }
+
+  // ============= 5) 主渲染 + 联动逻辑 ==============
+  function update(keepSelection = false) {
     const raw = rawEl.value ?? "";
     rawInfo.textContent = `字符数：${raw.length}`;
 
+    // 换行模式：更新映射与高亮
     if (mode === "nl") {
-      outEl.innerHTML = "";
-      outEl.textContent = renderNewlines(raw);
+      const { rendered, mapSrcToDst, mapDstToSrc } = buildNlMapping(raw);
+      lastNl.raw = raw;
+      lastNl.rendered = rendered;
+      lastNl.mapSrcToDst = mapSrcToDst;
+      lastNl.mapDstToSrc = mapDstToSrc;
+
+      // 如果有高亮范围，渲染右侧带 mark，否则纯文本
+      if (lastNl.highlightRendered) {
+        setRightHtml(applyMarkToText(rendered, lastNl.highlightRendered.start, lastNl.highlightRendered.end));
+      } else {
+        outEl.textContent = rendered;
+      }
       return;
     }
 
+    // JSON 模式
     const res = tryParseJson(raw);
     if (!res.ok) {
       outEl.innerHTML =
         `<div class="error">JSON 解析失败：${String(res.error)}`
-        + (res.candidate ? `\n\n候选片段(截取)：\n${res.candidate}` : "")
+        + (res.candidate ? `\n\n候选片段(截取)：\n${escapeHtml(res.candidate)}` : "")
         + `</div>`;
+      lastJson.ok = false;
+      lastJson.pretty = "";
+      lastJson.jsonTextUsed = "";
+      lastJson.keysToLineIndex = new Map();
+      lastJson.lines = [];
       return;
     }
 
-    outEl.textContent =
-      JSON.stringify(res.value, null, 2)
-      + `\n\n/* ${describeJson(res.value)}, source: ${res.source} */`;
+    const pretty = JSON.stringify(res.value, null, 2) + `\n\n/* ${describeJson(res.value)}, source: ${res.source} */`;
+    lastJson.ok = true;
+    lastJson.pretty = pretty;
+    lastJson.jsonTextUsed = res.jsonTextUsed || "";
+    const idxObj = buildJsonKeyIndex(JSON.stringify(res.value, null, 2));
+    lastJson.keysToLineIndex = idxObj.map;
+    lastJson.lines = idxObj.lines;
+
+    // 默认不高亮，纯文本输出
+    outEl.textContent = pretty;
   }
 
-  rawEl.addEventListener("input", update);
+  // ---- 5.1 换行模式：左 -> 右 选区同步高亮
+  rawEl.addEventListener("select", () => {
+    if (mode !== "nl") return;
+    const sel = getTextareaSelection(rawEl);
+    const m = lastNl.mapSrcToDst;
+    if (!m) return;
+    const rs = m[Math.min(sel.start, m.length - 1)] ?? 0;
+    const re = m[Math.min(sel.end, m.length - 1)] ?? rs;
+    lastNl.highlightRendered = { start: rs, end: re };
+    setRightHtml(applyMarkToText(lastNl.rendered, rs, re));
+  });
+
+  // ---- 5.2 换行模式：右 -> 左（通过点击位置近似映射）
+  // 说明：DIV 无法像 textarea 一样给出 selectionStart，做“精确反选”很难。
+  // 我们实现一个可用版：在右侧 mouseup 时，取 Selection 的文本在右侧的位置（用 indexOf 近似），再映射到左侧。
+  function getRightSelectionText() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return "";
+    return sel.toString();
+  }
+
+  outEl.addEventListener("mouseup", () => {
+    if (mode !== "nl") return;
+    const t = getRightSelectionText();
+    if (!t) return;
+
+    // 用“第一次出现的位置”近似定位
+    const start = lastNl.rendered.indexOf(t);
+    if (start < 0) return;
+    const end = start + t.length;
+
+    // dst->src 近似映射：取区间端点对应的 src index
+    const m2 = lastNl.mapDstToSrc;
+    if (!m2) return;
+
+    const ls = m2[Math.min(start, m2.length - 1)] ?? 0;
+    const le = m2[Math.min(end, m2.length - 1)] ?? ls;
+
+    lastNl.highlightRendered = { start, end };
+    setRightHtml(applyMarkToText(lastNl.rendered, start, end));
+    setTextareaSelection(rawEl, ls, le);
+  });
+
+  // ---- 5.3 JSON模式：右 -> 左（点击/选中某行，识别 key 并定位到左侧首次出现 "key"）
+  outEl.addEventListener("mouseup", () => {
+    if (mode !== "json") return;
+    if (!lastJson.ok) return;
+
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+
+    // 计算 selection 在 outEl.textContent 中的光标近似位置：
+    // 简化：用选中文本在 pretty 中的 indexOf（第一次出现），定位 key（足够用）
+    const picked = sel.toString();
+    if (!picked) return;
+
+    const idx = lastJson.pretty.indexOf(picked);
+    const cursor = idx >= 0 ? idx : 0;
+
+    // 从“纯JSON pretty（不含末尾注释）”里找 key：这里用 lastJson.lines 版本更稳
+    const purePretty = lastJson.lines.join("\n");
+    const cursor2 = Math.min(cursor, purePretty.length);
+    const keyInfo = findKeyNearCursorInPretty(purePretty, cursor2);
+    if (!keyInfo) return;
+
+    const needle = `"${keyInfo.key}"`;
+    const pos = findFirstOccurrenceInRaw(rawEl.value, needle);
+    if (pos >= 0) setTextareaSelection(rawEl, pos, pos + needle.length);
+
+    // 在右侧把该行高亮（只高亮 purePretty；末尾注释部分不处理）
+    const highlighted = highlightJsonLine(purePretty, keyInfo.line);
+    outEl.innerHTML = highlighted + "\n\n" + escapeHtml(`/* ${describeJson(JSON.parse(purePretty))} */`).replaceAll("\n", "<br>");
+    // 上面这一行为了避免再次 parse 纯pretty（含注释），这里做得保守：直接不给注释也行
+    // 如果你想保留原先注释，告诉我我再把“注释合并显示”做得更漂亮
+  });
+
+  // ---- 5.4 JSON模式：左 -> 右（如果左侧选中包含 "key"，则右侧定位该key行）
+  rawEl.addEventListener("mouseup", () => {
+    if (mode !== "json") return;
+    if (!lastJson.ok) return;
+
+    const sel = rawEl.value.slice(rawEl.selectionStart, rawEl.selectionEnd);
+    const m = sel.match(/"([^"]+)"/);
+    if (!m) return;
+    const key = m[1];
+
+    const line = lastJson.keysToLineIndex.get(key);
+    if (line == null) return;
+
+    const purePretty = lastJson.lines.join("\n");
+    outEl.innerHTML = highlightJsonLine(purePretty, line);
+  });
+
+  // ============= 6) 事件：输入保存历史、tab切换、按钮 ==============
+  rawEl.addEventListener("input", () => {
+    // 清空旧高亮
+    lastNl.highlightRendered = null;
+    scheduleHistorySave();
+    update();
+  });
 
   tabs.forEach(t => {
     t.addEventListener("click", () => {
       tabs.forEach(x => x.classList.remove("active"));
       t.classList.add("active");
       mode = t.dataset.mode;
+
+      // 切换模式时清高亮
+      lastNl.highlightRendered = null;
+
       update();
     });
   });
 
-  btnClear.addEventListener("click", () => { rawEl.value = ""; update(); rawEl.focus(); });
+  btnClear.addEventListener("click", () => {
+    rawEl.value = "";
+    lastNl.highlightRendered = null;
+    update();
+    rawEl.focus();
+  });
 
   btnSampleText.addEventListener("click", () => {
     rawEl.value = String.raw`\r\nvisit_id: 40399510\r\n性别: 男\r\n年龄: 12\r\n科室: 骨外科门诊\r\n诊断结论: 腹痛`;
-    update(); rawEl.focus();
+    addToHistory(rawEl.value);
+    update();
+    rawEl.focus();
   });
 
   btnSampleJsonObj.addEventListener("click", () => {
@@ -282,7 +682,9 @@
   "uniq_vid": "V001",
   "summary": "患者因【腹痛】于【2024年02月01日】在【门诊】就诊，最终诊断为【急性胃炎|胃食管反流】。"
 }`;
-    update(); rawEl.focus();
+    addToHistory(rawEl.value);
+    update();
+    rawEl.focus();
   });
 
   btnSampleJsonArr.addEventListener("click", () => {
@@ -291,10 +693,13 @@
   {"name": "肺癌", "time": "2018-06-28 15:26:10", "type": "门诊诊断"},
   {"name": "阻塞性肺气肿", "code": "J43.904", "time": "2018-06-28 16:16:08", "type": "门诊诊断"}
 ]`;
-    update(); rawEl.focus();
+    addToHistory(rawEl.value);
+    update();
+    rawEl.focus();
   });
 
   btnCopyRight.addEventListener("click", async () => {
+    // 复制右侧纯文本（不含 mark）
     const txt = outEl.textContent || "";
     try {
       await navigator.clipboard.writeText(txt);
@@ -308,6 +713,8 @@
     }
   });
 
+  // 初始渲染历史
+  renderHistoryPanel();
   update();
 </script>
 </body>
