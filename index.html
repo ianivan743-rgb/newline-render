@@ -120,13 +120,15 @@
 
   // ============= 1) 基础：换行渲染 / JSON抽取解析 ==============
   function renderNewlines(text) {
-    if (text == null) return "";
-    let s = String(text);
-    s = s.replaceAll("\\r\\n", "\n").replaceAll("\\n", "\n").replaceAll("\\r", "\n");
-    s = s.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
-    s = s.replace(/^\n+/, "");
-    return s;
-  }
+  if (text == null) return "";
+  let s = String(text);
+  s = s.replaceAll("\\t", "").replaceAll("\t", "");
+
+  s = s.replaceAll("\\r\\n", "\n").replaceAll("\\n", "\n").replaceAll("\\r", "\n");
+  s = s.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  s = s.replace(/^\n+/, "");
+  return s;
+}
 
   function stripMarkdownCodeFence(s) {
     s = String(s ?? "").trim();
@@ -246,6 +248,21 @@
     while (si < src.length) {
       mapSrcToDst[si] = di;
       const ch = src[si];
+      
+      // 字面量 \t
+      if (ch === "\\" && src.slice(si, si + 2) === "\\t") {
+        // 删除：不往 rendered 写任何字符
+        mapSrcToDst[si + 1] = di;   // 两个字符都映射到当前 di
+        si += 2;
+        continue;
+      }
+      
+      // 真实 tab
+      if (ch === "\t") {
+        // 删除：不往 rendered 写任何字符
+        si += 1;
+        continue;
+      }
 
       // 字面量 \r\n
       if (ch === "\\" && src.slice(si, si + 4) === "\\r\\n") {
@@ -618,7 +635,7 @@
 
     // 在右侧把该行高亮（只高亮 purePretty；末尾注释部分不处理）
     const highlighted = highlightJsonLine(purePretty, keyInfo.line);
-    outEl.innerHTML = highlighted + "\n\n" + escapeHtml(`/* ${describeJson(JSON.parse(purePretty))} */`).replaceAll("\n", "<br>");
+    outEl.innerHTML = highlighted;
     // 上面这一行为了避免再次 parse 纯pretty（含注释），这里做得保守：直接不给注释也行
     // 如果你想保留原先注释，告诉我我再把“注释合并显示”做得更漂亮
   });
