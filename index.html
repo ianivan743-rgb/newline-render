@@ -61,7 +61,7 @@
     <button id="btnSampleJsonObj">填充示例（JSON对象）</button>
     <button id="btnSampleJsonArr">填充示例（JSON数组）</button>
     <button id="btnCopyRight">复制右侧内容</button>
-    <span class="hint">JSON模式支持：对象 {...}、数组 [...]、以及“杂文本夹 JSON”。</span>
+    <span class="hint">JSON模式支持：对象 {...}、数组 [...]、以及"杂文本夹 JSON"。</span>
   </div>
 
   <div class="wrap">
@@ -97,7 +97,7 @@
   const tabs = document.querySelectorAll(".tab");
   let mode = "nl";
 
-  // ============= 0) 历史记录 UI 注入（不改你的HTML结构也能工作）=============
+  // ============= 0) 历史记录 UI 注入 =============
   const toolbar = document.querySelector(".toolbar");
   const historyWrap = document.createElement("div");
   historyWrap.style.width = "100%";
@@ -120,15 +120,18 @@
 
   // ============= 1) 基础：换行渲染 / JSON抽取解析 ==============
   function renderNewlines(text) {
-  if (text == null) return "";
-  let s = String(text);
-  s = s.replaceAll("\\t", "").replaceAll("\t", "");
-
-  s = s.replaceAll("\\r\\n", "\n").replaceAll("\\n", "\n").replaceAll("\\r", "\n");
-  s = s.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
-  s = s.replace(/^\n+/, "");
-  return s;
-}
+    if (text == null) return "";
+    let s = String(text);
+    s = s.replaceAll("\\t", "").replaceAll("\t", "");
+    s = s.replaceAll("\\r\\n", "\n").replaceAll("\\n", "\n").replaceAll("\\r", "\n");
+    s = s.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    s = s.replace(/^\n+/, "");
+    // 把"只含空白字符的行"变成空行
+    s = s.replace(/^[ \t]+$/mg, "");
+    // 压缩连续3个及以上换行为最多2个
+    s = s.replace(/\n{3,}/g, "\n\n");
+    return s;
+  }
 
   function stripMarkdownCodeFence(s) {
     s = String(s ?? "").trim();
@@ -154,7 +157,6 @@
 
     for (let i = start; i < n; i++) {
       const ch = s[i];
-
       if (inStr) {
         if (escape) { escape = false; continue; }
         if (ch === "\\") { escape = true; continue; }
@@ -176,36 +178,27 @@
     let out = "";
     let inStr = false;
     let escape = false;
-
     for (let i = 0; i < jsonText.length; i++) {
       const ch = jsonText[i];
-
       if (!inStr) {
         if (ch === '"') inStr = true;
         out += ch;
         continue;
       }
-
       if (escape) { out += ch; escape = false; continue; }
-
       if (ch === "\\") { out += ch; escape = true; continue; }
-
       if (ch === '"') { out += ch; inStr = false; continue; }
-
       if (ch === "\n") { out += "\\n"; continue; }
       if (ch === "\r") { out += "\\r"; continue; }
       if (ch === "\t") { out += "\\t"; continue; }
-
       out += ch;
     }
     return out;
   }
 
-  // 返回：{ok,value,source,candidate, jsonTextUsed}
   function tryParseJson(text) {
     let s = renderNewlines(text);
     s = stripMarkdownCodeFence(s);
-
     try {
       return { ok: true, value: JSON.parse(s), source: "direct", jsonTextUsed: s };
     } catch (e1) {
@@ -214,10 +207,8 @@
         return { ok: true, value: JSON.parse(fixed), source: "direct+escape", jsonTextUsed: fixed };
       } catch (e1b) {}
     }
-
     const cand = extractFirstJsonByBrackets(s);
     if (!cand) return { ok: false, error: new Error("未找到可解析的 JSON（没有 { 或 [ ）") };
-
     try {
       return { ok: true, value: JSON.parse(cand), source: "extracted", candidate: cand, jsonTextUsed: cand };
     } catch (e2) {
@@ -236,38 +227,32 @@
     return `type: ${typeof val}`;
   }
 
-  // ============= 2) 换行渲染：左右选区字符映射（近似但好用）=============
-  // 建立 raw -> rendered 的索引映射：把 \r\n \n \r 字面量当成 1 个 '\n'
+  // ============= 2) 换行渲染：左右选区字符映射 =============
   function buildNlMapping(raw) {
     const src = String(raw ?? "");
     let rendered = "";
     const mapSrcToDst = new Array(src.length + 1);
-    const mapDstToSrc = []; // dst index -> src index (nearest)
+    let mapDstToSrc = []; // let：后面需要重新赋值
 
     let si = 0, di = 0;
     while (si < src.length) {
       mapSrcToDst[si] = di;
       const ch = src[si];
-      
+
       // 字面量 \t
       if (ch === "\\" && src.slice(si, si + 2) === "\\t") {
-        // 删除：不往 rendered 写任何字符
-        mapSrcToDst[si + 1] = di;   // 两个字符都映射到当前 di
+        mapSrcToDst[si + 1] = di;
         si += 2;
         continue;
       }
-      
       // 真实 tab
       if (ch === "\t") {
-        // 删除：不往 rendered 写任何字符
         si += 1;
         continue;
       }
-
       // 字面量 \r\n
       if (ch === "\\" && src.slice(si, si + 4) === "\\r\\n") {
         rendered += "\n";
-        // 这4个字符都映射到同一个 di
         mapSrcToDst[si + 1] = di;
         mapSrcToDst[si + 2] = di;
         mapSrcToDst[si + 3] = di;
@@ -291,7 +276,6 @@
         si += 2; di += 1;
         continue;
       }
-
       // 真实换行统一：\r\n / \r -> \n
       if (ch === "\r") {
         if (src[si + 1] === "\n") {
@@ -306,18 +290,139 @@
         si += 1; di += 1;
         continue;
       }
-
       // 普通字符
       rendered += ch;
       mapDstToSrc[di] = si;
       si += 1; di += 1;
     }
     mapSrcToDst[src.length] = di;
-
-    // 补齐 mapDstToSrc 的结尾
     mapDstToSrc[rendered.length] = src.length;
 
-    return { rendered, mapSrcToDst, mapDstToSrc };
+    // 空白行清理：重建映射
+    {
+      const lines = rendered.split("\n");
+      // 只含空格/tab的行标记为需删除
+      const lineIsBlank = lines.map(l => /^[ \t]+$/.test(l));
+
+      const newMapDstToSrc = [];
+      let newRendered = "";
+      let charIdx = 0;
+      let newI = 0;
+
+      for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        if (lineIsBlank[li]) {
+          // 跳过空白行的空格字符，不写入 newRendered
+          charIdx += line.length;
+          // 换行符本身仍保留（最后一行除外）
+          if (li < lines.length - 1) {
+            newMapDstToSrc[newI] = mapDstToSrc[charIdx] ?? 0;
+            newRendered += "\n";
+            newI++;
+            charIdx++; // 跳过 \n
+          }
+        } else {
+          // 正常行：逐字符保留
+          for (let ci = 0; ci < line.length; ci++) {
+            newMapDstToSrc[newI] = mapDstToSrc[charIdx] ?? 0;
+            newRendered += line[ci];
+            newI++; charIdx++;
+          }
+          // 保留换行符（最后一行除外）
+          if (li < lines.length - 1) {
+            newMapDstToSrc[newI] = mapDstToSrc[charIdx] ?? 0;
+            newRendered += "\n";
+            newI++; charIdx++;
+          }
+        }
+      }
+      newMapDstToSrc[newI] = src.length;
+
+      // 重建 mapSrcToDst：反向推导 src -> newDst
+      const srcToNewDst = new Array(src.length + 1).fill(newI);
+      for (let nd = newI; nd >= 0; nd--) {
+        const sv = newMapDstToSrc[nd] ?? src.length;
+        srcToNewDst[Math.min(sv, src.length)] = nd;
+      }
+      // 前向填充：对没有直接映射的 src 位置，沿用上一个有效值
+      let lastNewDst = 0;
+      for (let sv = 0; sv <= src.length; sv++) {
+        if (srcToNewDst[sv] !== newI) {
+          lastNewDst = srcToNewDst[sv];
+        } else {
+          srcToNewDst[sv] = lastNewDst;
+        }
+      }
+
+      // ✅ 修正：去掉原先那个空循环体的死代码，直接赋值
+      mapDstToSrc = newMapDstToSrc;
+      rendered = newRendered;
+      for (let sv = 0; sv <= src.length; sv++) {
+        mapSrcToDst[sv] = srcToNewDst[sv];
+      }
+    }
+
+    // 压缩连续换行
+    const compressedResult = compressNewlines(rendered, mapDstToSrc, mapSrcToDst, src.length);
+
+    return {
+      rendered: compressedResult.rendered,
+      mapSrcToDst: compressedResult.mapSrcToDst,
+      mapDstToSrc: compressedResult.mapDstToSrc
+    };
+  }
+
+  // 辅助函数：压缩连续换行，并重建映射
+  function compressNewlines(rendered, mapDstToSrc, mapSrcToDst, srcLen) {
+    let newRendered = "";
+    const newMapDstToSrc = [];
+    const oldDstToNewDst = new Array(rendered.length + 1);
+
+    let i = 0, ni = 0;
+    while (i < rendered.length) {
+      if (rendered[i] === "\n") {
+        let j = i;
+        while (j < rendered.length && rendered[j] === "\n") { j++; }
+        const count = j - i;
+
+        if (count >= 3) {
+          // ✅ 修正：补上 oldDstToNewDst[j] 的赋值，避免后续重建 mapSrcToDst 时访问到 undefined
+          for (let k = i; k < j; k++) oldDstToNewDst[k] = ni;
+          oldDstToNewDst[j] = ni; // ✅ 补上结束位置
+          newMapDstToSrc[ni] = mapDstToSrc[i] ?? 0;
+          newRendered += "\n"; ni++;
+          newMapDstToSrc[ni] = mapDstToSrc[i] ?? 0;
+          newRendered += "\n"; ni++;
+        } else {
+          for (let k = i; k < j; k++) {
+            oldDstToNewDst[k] = ni;
+            newMapDstToSrc[ni] = mapDstToSrc[k] ?? 0;
+            newRendered += "\n"; ni++;
+          }
+        }
+        i = j;
+      } else {
+        oldDstToNewDst[i] = ni;
+        newMapDstToSrc[ni] = mapDstToSrc[i] ?? 0;
+        newRendered += rendered[i];
+        i++; ni++;
+      }
+    }
+    oldDstToNewDst[rendered.length] = ni;
+    newMapDstToSrc[ni] = mapDstToSrc[rendered.length] ?? srcLen;
+
+    // 重建 mapSrcToDst
+    const newMapSrcToDst = new Array(srcLen + 1);
+    for (let s = 0; s <= srcLen; s++) {
+      const oldDst = mapSrcToDst[s] ?? 0;
+      newMapSrcToDst[s] = oldDstToNewDst[Math.min(oldDst, rendered.length)] ?? ni;
+    }
+
+    return {
+      rendered: newRendered,
+      mapDstToSrc: newMapDstToSrc,
+      mapSrcToDst: newMapSrcToDst
+    };
   }
 
   function escapeHtml(s) {
@@ -330,7 +435,6 @@
   }
 
   function applyMarkToText(text, start, end) {
-    // start/end 是字符索引（0..len）
     const s = Math.max(0, Math.min(text.length, start));
     const e = Math.max(0, Math.min(text.length, end));
     if (e <= s) return escapeHtml(text);
@@ -344,36 +448,27 @@
     rendered: "",
     mapSrcToDst: null,
     mapDstToSrc: null,
-    highlightRaw: null,      // {start,end}
-    highlightRendered: null  // {start,end}
+    highlightRaw: null,
+    highlightRendered: null
   };
 
-  function setRightHtml(html) {
-    outEl.innerHTML = html;
-  }
+  function setRightHtml(html) { outEl.innerHTML = html; }
+  function getTextareaSelection(el) { return { start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 }; }
+  function setTextareaSelection(el, start, end) { el.focus(); el.setSelectionRange(start, end); }
 
-  function getTextareaSelection(el) {
-    return { start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 };
-  }
-
-  function setTextareaSelection(el, start, end) {
-    el.focus();
-    el.setSelectionRange(start, end);
-  }
-
-  // ============= 3) JSON解析：key 粒度联动（非字符级精确）=============
+  // ============= 3) JSON解析：key 粒度联动 =============
   let lastJson = {
     ok: false,
     pretty: "",
     jsonTextUsed: "",
-    keysToLineIndex: new Map(), // key -> first line index in pretty
+    keysToLineIndex: new Map(),
     lines: []
   };
 
   function buildJsonKeyIndex(prettyText) {
     const lines = prettyText.split("\n");
     const map = new Map();
-    const keyRe = /^\s*"([^"]+)"\s*:\s*/; // 匹配 "key":
+    const keyRe = /^\s*"([^"]+)"\s*:\s*/;
     for (let i = 0; i < lines.length; i++) {
       const m = lines[i].match(keyRe);
       if (m && !map.has(m[1])) map.set(m[1], i);
@@ -385,7 +480,6 @@
     const lines = prettyText.split("\n");
     if (lineIndex < 0 || lineIndex >= lines.length) return escapeHtml(prettyText);
     lines[lineIndex] = "<mark>" + escapeHtml(lines[lineIndex]) + "</mark>";
-    // 其他行也要 escape
     for (let i = 0; i < lines.length; i++) {
       if (i !== lineIndex) lines[i] = escapeHtml(lines[i]);
     }
@@ -393,7 +487,6 @@
   }
 
   function findKeyNearCursorInPretty(prettyText, cursorIndex) {
-    // 找 cursor 所在行
     const before = prettyText.slice(0, cursorIndex);
     const line = before.split("\n").length - 1;
     const lines = prettyText.split("\n");
@@ -426,14 +519,10 @@
       if (!s) return [];
       const arr = JSON.parse(s);
       return Array.isArray(arr) ? arr : [];
-    } catch {
-      return [];
-    }
+    } catch { return []; }
   }
 
-  function saveHistory(arr) {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(arr));
-  }
+  function saveHistory(arr) { localStorage.setItem(HISTORY_KEY, JSON.stringify(arr)); }
 
   function pruneHistory(arr) {
     const cutoff = nowTs() - HISTORY_DAYS * 24 * 3600 * 1000;
@@ -446,12 +535,8 @@
   function addToHistory(text) {
     const t = String(text ?? "");
     if (!t.trim()) return;
-
     let arr = pruneHistory(loadHistory());
-
-    // 简单去重：如果最新一条内容相同就不重复插入
     if (arr[0] && arr[0].text === t) return;
-
     arr.unshift({ ts: nowTs(), text: t });
     arr = pruneHistory(arr);
     saveHistory(arr);
@@ -486,7 +571,6 @@
     const idx = Number(btn.dataset.idx);
     let arr = pruneHistory(loadHistory());
     if (!Number.isFinite(idx) || idx < 0 || idx >= arr.length) return;
-
     if (act === "load") {
       rawEl.value = arr[idx].text;
       update(true);
@@ -503,7 +587,7 @@
     if (historyPanel.style.display === "block") renderHistoryPanel();
   });
 
-  btnClearHistory.addEventListener("click", () => {
+  btnClearHistory.addEventListener("click", ()=> {
     localStorage.removeItem(HISTORY_KEY);
     renderHistoryPanel();
   });
@@ -520,7 +604,6 @@
     const raw = rawEl.value ?? "";
     rawInfo.textContent = `字符数：${raw.length}`;
 
-    // 换行模式：更新映射与高亮
     if (mode === "nl") {
       const { rendered, mapSrcToDst, mapDstToSrc } = buildNlMapping(raw);
       lastNl.raw = raw;
@@ -528,7 +611,6 @@
       lastNl.mapSrcToDst = mapSrcToDst;
       lastNl.mapDstToSrc = mapDstToSrc;
 
-      // 如果有高亮范围，渲染右侧带 mark，否则纯文本
       if (lastNl.highlightRendered) {
         setRightHtml(applyMarkToText(rendered, lastNl.highlightRendered.start, lastNl.highlightRendered.end));
       } else {
@@ -560,7 +642,6 @@
     lastJson.keysToLineIndex = idxObj.map;
     lastJson.lines = idxObj.lines;
 
-    // 默认不高亮，纯文本输出
     outEl.textContent = pretty;
   }
 
@@ -576,9 +657,7 @@
     setRightHtml(applyMarkToText(lastNl.rendered, rs, re));
   });
 
-  // ---- 5.2 换行模式：右 -> 左（通过点击位置近似映射）
-  // 说明：DIV 无法像 textarea 一样给出 selectionStart，做“精确反选”很难。
-  // 我们实现一个可用版：在右侧 mouseup 时，取 Selection 的文本在右侧的位置（用 indexOf 近似），再映射到左侧。
+  // ---- 5.2 换行模式：右 -> 左
   function getRightSelectionText() {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) return "";
@@ -590,12 +669,10 @@
     const t = getRightSelectionText();
     if (!t) return;
 
-    // 用“第一次出现的位置”近似定位
     const start = lastNl.rendered.indexOf(t);
     if (start < 0) return;
     const end = start + t.length;
 
-    // dst->src 近似映射：取区间端点对应的 src index
     const m2 = lastNl.mapDstToSrc;
     if (!m2) return;
 
@@ -607,7 +684,7 @@
     setTextareaSelection(rawEl, ls, le);
   });
 
-  // ---- 5.3 JSON模式：右 -> 左（点击/选中某行，识别 key 并定位到左侧首次出现 "key"）
+  // ---- 5.3 JSON模式：右 -> 左
   outEl.addEventListener("mouseup", () => {
     if (mode !== "json") return;
     if (!lastJson.ok) return;
@@ -615,15 +692,12 @@
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) return;
 
-    // 计算 selection 在 outEl.textContent 中的光标近似位置：
-    // 简化：用选中文本在 pretty 中的 indexOf（第一次出现），定位 key（足够用）
     const picked = sel.toString();
     if (!picked) return;
 
     const idx = lastJson.pretty.indexOf(picked);
     const cursor = idx >= 0 ? idx : 0;
 
-    // 从“纯JSON pretty（不含末尾注释）”里找 key：这里用 lastJson.lines 版本更稳
     const purePretty = lastJson.lines.join("\n");
     const cursor2 = Math.min(cursor, purePretty.length);
     const keyInfo = findKeyNearCursorInPretty(purePretty, cursor2);
@@ -633,14 +707,11 @@
     const pos = findFirstOccurrenceInRaw(rawEl.value, needle);
     if (pos >= 0) setTextareaSelection(rawEl, pos, pos + needle.length);
 
-    // 在右侧把该行高亮（只高亮 purePretty；末尾注释部分不处理）
     const highlighted = highlightJsonLine(purePretty, keyInfo.line);
     outEl.innerHTML = highlighted;
-    // 上面这一行为了避免再次 parse 纯pretty（含注释），这里做得保守：直接不给注释也行
-    // 如果你想保留原先注释，告诉我我再把“注释合并显示”做得更漂亮
   });
 
-  // ---- 5.4 JSON模式：左 -> 右（如果左侧选中包含 "key"，则右侧定位该key行）
+  // ---- 5.4 JSON模式：左 -> 右
   rawEl.addEventListener("mouseup", () => {
     if (mode !== "json") return;
     if (!lastJson.ok) return;
@@ -659,7 +730,6 @@
 
   // ============= 6) 事件：输入保存历史、tab切换、按钮 ==============
   rawEl.addEventListener("input", () => {
-    // 清空旧高亮
     lastNl.highlightRendered = null;
     scheduleHistorySave();
     update();
@@ -670,10 +740,7 @@
       tabs.forEach(x => x.classList.remove("active"));
       t.classList.add("active");
       mode = t.dataset.mode;
-
-      // 切换模式时清高亮
       lastNl.highlightRendered = null;
-
       update();
     });
   });
@@ -716,7 +783,6 @@
   });
 
   btnCopyRight.addEventListener("click", async () => {
-    // 复制右侧纯文本（不含 mark）
     const txt = outEl.textContent || "";
     try {
       await navigator.clipboard.writeText(txt);
@@ -736,3 +802,4 @@
 </script>
 </body>
 </html>
+
